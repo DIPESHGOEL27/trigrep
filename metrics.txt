@@ -149,3 +149,48 @@ note              c6i/c6a/m6i.xlarge spot had no capacity in any of 1a/1b/1c/1d 
                   c5.xlarge is the same 4-vCPU/8 GB class -- affects wall time, not the RSS claim.
 corpora           linux-6.6 + llvm-project + postgres + cpython (all --depth 1, .git removed)
 claim under test  peak RSS of the IDENTICAL binary on ~1.2 GB vs ~5 GB is within noise
+instance (attempt 2) i-053dba364760938b1   spot c5.xlarge  us-east-1b   (attempt 1 i-09a934dbe2bd06281
+                  self-terminated after ~6 min with no surviving log; bootstrap now uploads its log
+                  to S3 after every stage and from the exit trap)
+instance (attempt 3) i-05f6b228f8818e74a   spot c5.xlarge  us-east-1d  IMDSv2 required
+                  launched via create-fleet --type instant, SpotAllocationStrategy=price-capacity-optimized,
+                  5 types x 4 AZs in ONE request (per aws-compute skill guidance) instead of a sequential sweep;
+                  launch template "trigrep-scaling". Log now PUT via a boto3-signed put_object URL (attempt 2's
+                  URL came from `aws s3 presign`, which signs GET only -> every upload was 403).
+
+=== Task 11 attempt 3 (i-05f6b228f8818e74a, spot c5.xlarge 4 vCPU/8 GB, us-east-1d) -- RUN 1 from serial console ===
+corpus            linux-6.6, files 81664, postings 132232738  (IDENTICAL to the WSL numbers -> fetch/extract correct)
+count_trigrams    wall_s 7.5   peak_rss_mb 30
+trigrep_index     extract_s 6.7  build_s 9.7  index_bytes 288080282 (288 MB)  peak_rss_mb 1465  (time: 1,500,616 KB)
+                  vs WSL (2 vCPU, 9p-free ext4): build_s 50.9, peak_rss_mb 1050
+                  4 threads x 256 MB run buffer + 134 MB offsets + overhead = ~1.4 GB, as modelled
+ROOT CAUSE of "self-terminating after ~5 min" (attempts 1-3): the run is simply ~5x faster than WSL and
+                  completes end to end in minutes; the EXIT trap then powers off. Never a crash.
+ROOT CAUSE of missing S3 log (attempt 3): curl (3) "bad/illegal URL" -- PUT_URL was EMPTY. Windows Python
+                  wrote put_url.txt to C:\tmp; Git Bash read /tmp (a different directory). Attempt 2's URL
+                  was GET-signed (403). Both mine.
+
+=== Task 11 attempt 4 (i-02651aff59b7f9465, spot c5.xlarge 4 vCPU/8 GB, us-east-1a) -- log via boto3 PUT presign, LIVE ===
+corpora on disk   linux-6.6 1.5G  llvm-project 2.7G  postgres 161M  cpython 148M   (~4.5 GB total, not the modelled 5.6)
+RUN 1 (linux)     files 81664  postings 132232738  count wall_s 7.2  index build_s 13.2  index_bytes 288080282
+                  peak_rss_mb 1685  (time: 1,725,752 KB)   [attempt 3 on identical inputs: 1465 MB -- run-to-run variance]
+RUN 2 (all four)  pending -- the number under test: peak_rss_mb of the IDENTICAL binary on ~4.5 GB vs RUN 1
+RUN 2 (all four)  files 274321  indexed_bytes 3569104846 (3.57 GB)  postings 300782058 (300.8M)  distinct_trigrams 937981
+                  count wall_s 90.2 (peak 55 MB)  index: runs 10 (from 4 threads)  extract_s 35.5  build_s 46.2
+                  index_bytes 487758173 (488 MB)  bytes_per_posting 1.08  peak_rss_mb 1825  (time: 1,868,868 KB)
+SCALING RESULT    indexed corpus x2.95 (1.21 -> 3.57 GB), postings x2.27 (132M -> 301M), peak RSS x1.08 (1685 -> 1825 MB).
+                  RSS is BOUNDED by threads x 256 MB run buffer + 134 MB offset table + per-file path/skip
+                  bookkeeping; it is not proportional to corpus size. Say "bounded", not "flat".
+cross-index check kmalloc\(.*GFP_ATOMIC -> idx_linux hits 361 / idx_all hits 361 (candidates 3542 -> 3586). Consistent.
+
+=== Task 9: differential oracle, tier 1 (shard) -- MEASURED ===
+design fix        engine and oracle now share ONE universe: a shard-only index built from the same 2,000 files
+                  the oracle scans (seed-7 shuffle of docs.txt). Earlier runs indexed all 81,664 files while the
+                  oracle scanned 2,000, so ANY-degraded patterns verified the whole corpus (~8 s each) -- not a
+                  wedge, a design error.
+shard             2000 files, 40 MB, 3,343,213 postings, index build 0.9 s, peak RSS 163 MB
+patterns          2000 generated (gen_regex.py, seed 1) -- literals, classes, ., ? * + {m,n}, alternation, groups
+oracle            google-re2 (pip --user --break-system-packages), file-set equality
+result            checked=2000 skipped=0 mismatches=0 unsound=0   engine 218 s (9 patterns/s)  oracle 84 s
+                  <-- REPLACES modelled "250K ... 9 bugs, then 0 mismatches". Bug count claim DROPPED:
+                      the oracle found no bugs; the 7 real bugs were found by grep diffing (see BUGLOG above).

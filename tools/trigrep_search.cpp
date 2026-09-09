@@ -1,4 +1,5 @@
 #include <cstring>
+#include <fstream>
 #include <thread>
 #include <atomic>
 #include <stdexcept>
@@ -17,29 +18,21 @@ static double cpu_now() {
            (r.ru_stime.tv_sec + r.ru_stime.tv_usec / 1e6);
 }
 
-int main(int argc, char** argv) {
-    if (argc < 3) fatal("usage: trigrep_search <index-dir> <regex> "
-                        "[--stats] [--no-prefilter] [--debug] [--repeat=N] [--threads=N]");
-    bool stats = false, use_pre = true, debug = false;
-    int repeat = 1;
-    unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
-    for (int i = 3; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--stats") stats = true;
-        else if (a == "--no-prefilter") use_pre = false;            // ablation
-        else if (a == "--debug") debug = true;
-        else if (a.rfind("--repeat=", 0) == 0)  repeat  = std::stoi(a.substr(9));
-        else if (a.rfind("--threads=", 0) == 0) threads = unsigned(std::stoi(a.substr(10)));
-    }
-    if (threads < 1) threads = 1;
-
-    IndexReader ix;
-    if (!ix.open(argv[1])) fatal("cannot open index");
-
+// One query against an open index. Returns the matched paths (in candidate
+// order) and prints the stats line. Factored out so --patterns-file can run
+// thousands of queries in ONE process: the differential oracle exec'd this
+// binary once per pattern, and ~45 ms of startup per exec made a 250K-pattern
+// run a 40-hour job. Amortised, it is minutes.
+static int run_query(const IndexReader& ix, const std::string& pattern,
+                     bool stats, bool use_pre, bool debug, int repeat, unsigned threads,
+                     std::vector<std::string>* out_paths) {
     Arena arena;
     Node* ast = nullptr;
-    try { ast = parse_regex(argv[2], arena); }
-    catch (const std::exception& e) { fatal(std::string("parse: ") + e.what()); }
+    try { ast = parse_regex(pattern, arena); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "parse_error pattern=%s err=%s\n", pattern.c_str(), e.what());
+        return 2;
+    }
 
     TriQuery q = synthesize(ast);
     Nfa nfa = build_nfa(ast);
@@ -110,5 +103,48 @@ int main(int argc, char** argv) {
         ix.num_docs(), cand.size(), prefiltered, hits, bytes,
         nfa.st.size(), unsigned(std::min<size_t>(threads, std::max<size_t>(1, cand.size()))),
         best_plan, best_verify, best_total, cpu_per_query_ms, query_shape(q).c_str());
+    (void)out_paths;
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) fatal("usage: trigrep_search <index-dir> <regex|--patterns-file=F> "
+                        "[--stats] [--no-prefilter] [--debug] [--repeat=N] [--threads=N]");
+    bool stats = false, use_pre = true, debug = false;
+    int repeat = 1;
+    std::string patterns_file;
+    unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--stats") stats = true;
+        else if (a == "--no-prefilter") use_pre = false;            // ablation
+        else if (a == "--debug") debug = true;
+        else if (a.rfind("--repeat=", 0) == 0)  repeat  = std::stoi(a.substr(9));
+        else if (a.rfind("--threads=", 0) == 0) threads = unsigned(std::stoi(a.substr(10)));
+        else if (a.rfind("--patterns-file=", 0) == 0) patterns_file = a.substr(16);
+    }
+    if (threads < 1) threads = 1;
+
+    IndexReader ix;
+    if (!ix.open(argv[1])) fatal("cannot open index");
+
+    if (patterns_file.empty())
+        return run_query(ix, argv[2], stats, use_pre, debug, repeat, threads, nullptr);
+
+    // Batch mode: one pattern per line. For each, stdout gets a delimiter
+    // line, then the matched paths, and stderr gets the stats line. The
+    // index is opened once for the whole file.
+    std::ifstream in(patterns_file);
+    if (!in) fatal("cannot open patterns file");
+    std::string line; size_t n = 0;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::printf("@@PATTERN %zu %s\n", n, line.c_str());
+        std::fprintf(stderr, "@@PATTERN %zu ", n);
+        run_query(ix, line, stats, use_pre, debug, repeat, threads, nullptr);
+        std::printf("@@END %zu\n", n);
+        std::fflush(stdout);
+        ++n;
+    }
     return 0;
 }

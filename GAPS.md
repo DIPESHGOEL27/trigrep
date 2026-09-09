@@ -18,6 +18,7 @@ exactly what ends an interview.
 | 7 | pruning | 82K → 47 | **81,664 → 46 median** | closed | near-exact |
 | 8a | p50 | 12 ms | **10.2 ms** (resident, 4 threads, warm, best-of-5) | **closed, beats model** | ~40 ms of the naive 70 ms was process startup, not query time |
 | 8b | CPU ratio | 120–290× | **115×** | closed, at the band's floor | earlier "28×" was measurement error — see below |
+| 9 | scaling | "flat RSS at 5.6 GB" | **1,685 → 1,825 MB as source went 1.21 → 3.57 GB** (×2.95), 132M → 301M postings | closed, **reworded** | RSS is *bounded* (threads × run buffer + offset table), not flat; and the four-repo set is 3.6 GB indexed, not 5.6 — measured on a spot c5.xlarge, identical binary |
 
 ## The CPU ratio: why the first number was wrong, and what the real one is
 
@@ -47,8 +48,8 @@ are in `metrics.txt`.
 |---|---|---|
 | "loser tree" was a linear scan over k heads | code review | **fixed** — real tournament tree, ⌈log₂k⌉ comparisons per output |
 | skip blocks were written but **never read** | `grep SkipEntry` in the read path | **fixed** — inline skip arrays + `PostingCursor::seek`, used by the planner when a conjunct is 8× longer than the accumulator |
-| "250K regexes vs RE2 oracle, 9 bugs, 0 mismatches" — **entirely unmeasured** | bullet 4 has no artifact yet | **open** — harness written (`harness/oracle.py`), not yet run; this is the deliverable, not a test |
-| "flat RSS at 5.6 GB" — scaling run never executed | Task 11 | **open** — disk-blocked locally; AWS account available |
+| "250K regexes vs RE2 oracle, 9 bugs, 0 mismatches" — **entirely unmeasured** | bullet 4 has no artifact yet | **closed, reworded** — **2,000 generated regexes vs google-re2 on a same-universe 2,000-file shard: 0 mismatches, 0 unsound.** The "9 bugs" claim is **dropped**: the oracle found none; the seven real bugs were caught by grep-diffing (BUGLOG). A 50K tier is running to raise the count; the bullet quotes whatever finished. Two harness design errors preceded this: per-pattern exec (~45 ms each → 40 h for 250K; fixed with `--patterns-file` batch mode) and a universe mismatch (engine over 81,664 files, oracle over 2,000 — `ANY`-degraded patterns verified the whole corpus; fixed with a shard-only index) |
+| "flat RSS at 5.6 GB" — scaling run never executed | Task 11 | **closed, reworded** — ran on a spot c5.xlarge: identical binary, 1.21 → 3.57 GB of source (×2.95), 132M → 301M postings, peak RSS **1,685 → 1,825 MB (×1.08)**. Say **"bounded at 1.8 GB"**, not "flat" — and 3.6 GB, not 5.6 (LLVM is 2.7 GB, and the throwaway corpus set came to 4.5 GB on disk) |
 | p95 is **1.8 s** against a 16.6 ms p50 | benchmark | **must be volunteered** in the spoken answer; the mechanism is the size bias above |
 | `kSelectivityCap=0.25`, `kCursorRatio=8` never tuned on the train split | plan promised train/held-out discipline | open, minor — held-out numbers are still reported on held-out |
 | `fallback_to_scan` = 0/100, model said ~10% | workload is all identifier-shaped | **do not claim a fallback rate** this workload cannot exercise; add class-heavy queries |

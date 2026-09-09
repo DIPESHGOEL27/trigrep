@@ -18,7 +18,10 @@ exec > >(tee -a "$LOG") 2>&1
 set -ux
 PUT_URL='__PUT_URL__'
 upload() { curl -sS -X PUT -T "$LOG" "$PUT_URL" -o /dev/null -w "upload(%{http_code}) " || true; echo; }
-trap 'rc=$?; echo "=== bootstrap exiting rc=$rc at $(date -u +%FT%TZ) ==="; upload; sleep 5; shutdown -h now' EXIT
+# On ANY exit: say which command was running, ship the log, then power off.
+# Attempts 1 and 2 self-terminated with no surviving evidence -- the PUT had
+# been signed for GET (403) and cloud-init-output.log dies with the volume.
+trap 'rc=$?; echo "=== bootstrap exiting rc=$rc line=$LINENO cmd=[$BASH_COMMAND] at $(date -u +%FT%TZ) ==="; cp /var/log/cloud-init-output.log /tmp/ci.log 2>/dev/null; tail -40 /tmp/ci.log 2>/dev/null; upload; sleep 5; shutdown -h now' EXIT
 
 echo "=== trigrep scaling run start $(date -u +%FT%TZ) ==="
 echo "--- host ---"; nproc; free -g | head -2; df -h / | tail -1; uname -r
