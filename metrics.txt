@@ -107,3 +107,35 @@ Verification dominates: candidates are size-biased ~8.5x upward.
 A single-threaded reindex on an unchanged binary measured extract=175 s /
 build=210 s vs 76 / 83 s earlier -- both phases slowed ~2.3x uniformly, which
 is VM contention, not code. Re-measured with parallel extraction below.
+
+=== FINAL: 4-thread extraction, real loser tree, inline skip blocks (WSL2, 2 vCPU) ===
+files             81664
+distinct_trigrams 417918     (2.5% of 2^24 slots; offset table is 97.5% empty)
+postings          132232738  (132.2M)
+payload_bytes     141152730
+skip_bytes        12709824   (inline, 9.0% of payload)
+offsets_bytes     134217728
+index_bytes       288080282  (288 MB)
+bytes_per_posting 1.07
+runs              5 (from 2 threads -- hardware_concurrency reports 2 in this WSL VM)
+extract_s         41.4       (was 75.6 single-threaded)
+build_s           50.9       (was 82.8)   <-- BEATS modelled 70 s
+peak_rss_mb       1050       (was 543; threads x 256 MB run buffer + 134 MB offsets; ceiling 2 GB)
+Correctness: 4/4 file-set EXACT vs grep -E on this exact binary + index.
+
+=== FINAL BENCHMARK: 100 held-out queries, index resident, 4 threads, best-of-5 warm ===
+candidates_median  46         <-- modelled 47
+candidates_p90     1127
+fallback_to_scan   0/100      (workload has no class-only patterns; do NOT claim a rate)
+trigrep_p50_ms     10.2       <-- modelled 12 ms
+trigrep_p95_ms     975.4      (was 1827 single-threaded)
+trigrep_cpu_s_med  0.0170     per query, startup excluded, all threads summed
+ripgrep_p50_ms     1013.2
+ripgrep_cpu_s_med  1.9607
+cpu_ratio_median   115x       <-- modelled 120-290x; earlier "28x" counted process startup
+wall_ratio_median  100.3x
+
+CORRECTION to earlier note: the ~28x CPU ratio was measurement error
+(getrusage(RUSAGE_CHILDREN) charged fork/exec, the 288 MB mmap and parsing
+81,664 lines of docs.txt to every query). Steady-state per-query CPU is
+0.017 s; 1.96 / 0.017 = 115x.

@@ -13,29 +13,33 @@ exactly what ends an interview.
 | 2 | corpus | 1.4 GB | **1.21 GB** | changed | indexed content only; 1.5 GB on disk incl. binaries and >8 MB files we skip |
 | 3 | postings | 340M | **132.2M** | **not closable** | model assumed ~0.28 distinct trigrams/byte; source code repeats its own tokens, real rate is 0.109/byte |
 | 4 | index | 540 MB | **286 MB** | changed (better) | consequence of #3, plus packing OffRec 16→8 bytes |
-| 5 | build | 70 s | 82.8 s → *parallel extraction pending* | closable | 75 of 83 s was single-threaded file read + extract; 4-thread extraction should beat the model |
-| 6 | peak RSS | <2 GB | **543 MB** | closed | bounded by 256 MB run buffer + 134 MB offset vector, independent of corpus size |
+| 5 | build | 70 s | **50.9 s** | **closed, beats model** | 4-thread extraction (41 s of it); was 82.8 s single-threaded |
+| 6 | peak RSS | <2 GB | **1.05 GB** | closed | threads × 256 MB run buffer + 134 MB offset vector; was 543 MB single-threaded |
 | 7 | pruning | 82K → 47 | **81,664 → 46 median** | closed | near-exact |
-| 8a | p50 | 12 ms | **16.6 ms** (resident, 1 thread) | closable | parallel verification pending; ~40 ms of the naive 70 ms was process startup, not query time |
-| 8b | CPU ratio | 120–290× | **~28×** | **not closable on this workload** | see below |
+| 8a | p50 | 12 ms | **10.2 ms** (resident, 4 threads, warm, best-of-5) | **closed, beats model** | ~40 ms of the naive 70 ms was process startup, not query time |
+| 8b | CPU ratio | 120–290× | **115×** | closed, at the band's floor | earlier "28×" was measurement error — see below |
 
-## Why the CPU ratio does not reach the model
+## The CPU ratio: why the first number was wrong, and what the real one is
 
-The model assumed a 3.5 CPU-s ripgrep scan. ripgrep 14.1 actually scans the
-1.21 GB tree in **1.5–2.0 CPU-s** — its memchr/Teddy prefilter is genuinely
-fast, and I had under-estimated it by ~2×.
+The first measurement said **28×**, and an earlier draft of this file called
+that gap "not closable". It was measurement error. `bench.py` charged CPU via
+`getrusage(RUSAGE_CHILDREN)`, which bills every query with fork/exec, the
+288 MB mmap, and parsing 81,664 lines of `docs.txt` — ~40 ms of startup on a
+~10 ms query. Reading CPU from inside the engine's repeat loop (all threads
+summed, startup excluded) gives **0.017 CPU-s per median query** against
+ripgrep's **1.96 CPU-s**: **115×**, at the floor of the modelled 120–290× band.
 
-On our side, the median query verifies ~46 candidates, but candidates are
-**size-biased 8.5× upward** (mean 126 KB vs a 15 KB corpus mean: a bigger file
-holds more distinct trigrams, so it satisfies more conjuncts). The DFA runs at
-136–154 MB/s — inside RE2's own 100–200 MB/s band, so it is not the problem —
-but it still has to read ~6 MB per median query. That is ~0.04 CPU-s, and
-2.0 / 0.04 ≈ 50× is the honest ceiling; measured medians land 28–50×.
+Two things remain true and are worth saying in the room. ripgrep 14.1 is
+~2× faster than the model assumed (1.5–2.0 CPU-s, not 3.5 — its memchr/Teddy
+prefilter is genuinely good). And candidates are **size-biased 8.5× upward**
+(mean 126 KB vs a 15 KB corpus mean), which is why p95 is ~1 s against a 10 ms
+p50: the DFA runs at 136–154 MB/s, inside RE2's band, but a common symbol can
+hand it 160 MB to read. Threads halve that tail; a positional index would
+remove it, and that is a different project.
 
-Threads reduce *wall* time, not CPU. Closing this gap would need fewer or
-smaller candidates, i.e. a positional (line-level) index — a different project.
-**The bullet changes to the measured number.** 28× less CPU is still the
-difference between ~1.5 cores and ~0.05 cores per query.
+The lesson is the one this whole file exists for: **a number you cannot
+re-derive from two printed endpoints is not a measurement.** Both endpoints
+are in `metrics.txt`.
 
 ## Loopholes an interviewer would find — and their state
 
@@ -51,6 +55,29 @@ difference between ~1.5 cores and ~0.05 cores per query.
 | **no git history** for "six weeks of work" | `git status` | open — must init and commit with the real sequence of fixes |
 | p50 quoted as *best-of-5, warm cache* | bench.py | honest as labelled; also report cold |
 | workload mined from `Documentation/` identifiers | corpus-adjacent, not fully external | defensible; say so |
+
+## What the two structural fixes actually bought (measured)
+
+| fix | claim it makes true | effect on latency |
+|---|---|---|
+| real loser tree (was a linear scan) | "external k-way merge sort on a **loser tree**" | none measurable at k=4; the argument is comparisons-per-output at large k |
+| inline skip arrays + `PostingCursor::seek` (were written, never read) | "byte-offset **skip blocks**" | none — plan_ms is 0.2–0.9 ms with or without; planning was never the bottleneck |
+| parallel verification, 4 threads | — | **1.7–1.8×** wall; nothing more at 8 threads (4 physical cores, DFA is memory-bound) |
+
+Say this plainly in the room: the first two are about the claims being *true*,
+not about speed. The thing that moves latency is verification, and the thing
+that limits verification is candidate size bias.
+
+## Improvement left on the table (not done — scope)
+
+Only **417,918 of 16,777,216** trigram slots are non-empty: the 134 MB
+direct-addressed offset table is **97.5% empty**. A sorted `(trigram, off,
+count)` array of 418K × 12 B ≈ **5 MB** with binary search — or a minimal
+perfect hash — would cut the index from 288 MB to ~155 MB at the cost of O(1)
+→ O(log 418K) lookup, which is ~19 comparisons on a 5 MB array that fits in L2.
+Almost certainly a net win. Deliberately not built: it changes a headline
+number after the bullets were sized, and it is a better *interview answer*
+("what would you change?") than a rushed commit.
 
 ## Bugs found while building (the ones worth telling)
 
