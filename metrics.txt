@@ -139,3 +139,13 @@ CORRECTION to earlier note: the ~28x CPU ratio was measurement error
 (getrusage(RUSAGE_CHILDREN) charged fork/exec, the 288 MB mmap and parsing
 81,664 lines of docs.txt to every query). Steady-state per-query CPU is
 0.017 s; 1.96 / 0.017 = 115x.
+
+=== Task 11: scaling run launched (AWS 977098995841, us-east-1, profile dipesh-correct) ===
+instance          i-09a934dbe2bd06281   spot c5.xlarge (4 vCPU / 8 GB)  us-east-1d
+ami               ami-025d99823a4caad37 (Ubuntu 24.04, Canonical, 2026-09-04)
+storage           50 GB gp3, DeleteOnTermination; instance-initiated-shutdown -> terminate
+source            harness/aws_bootstrap.sh + 19 KB src tarball via presigned S3 URL (throwaway bucket)
+note              c6i/c6a/m6i.xlarge spot had no capacity in any of 1a/1b/1c/1d at 17:05 UTC;
+                  c5.xlarge is the same 4-vCPU/8 GB class -- affects wall time, not the RSS claim.
+corpora           linux-6.6 + llvm-project + postgres + cpython (all --depth 1, .git removed)
+claim under test  peak RSS of the IDENTICAL binary on ~1.2 GB vs ~5 GB is within noise
