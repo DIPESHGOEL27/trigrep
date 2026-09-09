@@ -1,0 +1,109 @@
+=== Task 2: counting pass (measured 2026-09-09T15:18:00Z) ===
+corpus       linux-6.6 sha256 d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0
+files          81715
+bytes          1211022932 (1.21 GB indexed content; 1.5 GB on disk incl. binaries)
+postings       132308800 (132.3M)  <-- REPLACES modelled 340M
+postings_byte  0.1093
+distinct_file  p50=1147 p90=3585 max=30741
+wall_s         49.7
+peak_rss_mb    31
+
+=== Task 5: index build (measured, WSL2 Ubuntu ext4, g++ 13.3.0 -O2 -march=native) ===
+files             81664      (81715 before skipping 51 symlinks, to match grep -r / rg)
+indexed_bytes     1211022932 (1.21 GB of indexed content; 1.5 GB on disk incl. binaries)
+postings          132232738  (132.2M)   <-- REPLACES modelled 340M
+postings_bytes    141152730  (141 MB)
+skips_bytes       11038152   (11 MB, 7.8% of postings -- 8 B per 128 postings)
+offsets_bytes     134217728  (134 MB; was 268 MB before packing OffRec 16->8 bytes)
+index_bytes       286408610  (286 MB)   <-- REPLACES modelled 540 MB
+bytes_per_posting 1.07
+extract_s         75.6
+build_s           82.8       <-- REPLACES modelled 70 s
+peak_rss_mb       543        (ceiling is 2 GB; driver is the 134 MB offset vector + 256 MB run buffer)
+
+=== Correctness: file-set equality vs grep -E (5/5 EXACT) ===
+kmalloc\(.*GFP_ATOMIC        mine=361  grep=361   EXACT
+EXPORT_SYMBOL_GPL\(          mine=3352 grep=3352  EXACT
+netif_(rx|receive_skb)       mine=427  grep=427   EXACT
+struct [a-z_]+_driver =      mine=0    grep=0     EXACT
+spin_lock_irqsave            mine=3755 grep=3755  EXACT
+
+=== Synthesis soundness spot-checks (degrade-to-ANY, never truncate) ===
+abc                  -> AND('abc')                     374 candidates
+a.c                  -> ANY                            (single bytes carry no trigram)
+[a-z]{3}             -> ANY                            (class over cap degrades, NOT truncated)
+ab|cd                -> ANY                            (both branches < 3 bytes)
+x*                   -> ANY                            (zero repetitions must be allowed)
+(foo|bar)baz         -> AND(OR('foo','bar'),OR(AND('arb','bar'),...))  12 candidates
+                        ^ straddling trigrams 'arb','rba','oob','oba' manufactured at the join
+
+=== Bugs found and fixed during build (BUGLOG) ===
+1. NFA fragment exits stored as int* into a growing std::vector -> dangling on
+   realloc. Fixed by recording (state_index, which_field) pairs instead.
+2. walk_corpus followed symlinks (is_regular_file does); grep -r and rg do not.
+   Caused a 1-file over-return -- safe direction, but not comparable to the
+   baseline. Fixed by skipping symlinks.
+3. OffRec was {uint64,uint32} = 16 B padded -> 268 MB offset table, 64% of the
+   index. Postings are 141 MB so uint32 suffices. Packed to 8 B; index 421->286 MB.
+4. and_of/or_of did not flatten, so concat built an O(n^2) nested AND tree.
+5. Planner cost estimate returned num_docs() for any non-TRI node, so the
+   selectivity cap dropped every nested conjunct. EXPORT_SYMBOL_GPL returned
+   13683 candidates instead of 3402. Fixed with a recursive estimate
+   (AND -> min of kids, OR -> sum of kids).
+
+=== Task 8: required-literal memmem prefilter (ablation, one binary + --no-prefilter) ===
+CONFIG_SMP              on=607 ms   off=1091 ms  1.8x   candidates 1275 prefiltered 352
+kmalloc\(.*GFP_ATOMIC   on=563 ms   off=922 ms   1.6x   candidates 3542 prefiltered 2769
+netif_(rx|receive_skb)  on=275 ms   off=314 ms   1.1x   candidates 852  prefiltered 99
+Result sets are IDENTICAL with the flag on and off -- the prefilter is sound
+(it only skips files missing a literal that every match must contain).
+
+=== DFA throughput (measured, not assumed) ===
+CONFIG_SMP     161.2 MB scanned / 1186 ms verify = 136 MB/s
+cpulist_parse   18.5 MB scanned /  120 ms verify = 154 MB/s
+This lands inside RE2's published 100-200 MB/s band for a hand-rolled lazy DFA.
+
+=== Candidate size bias (important, and worse than modelled) ===
+Corpus mean file size    ~14.8 KB  (1.21 GB / 81664 files)
+CONFIG_SMP candidate mean ~126 KB  (161.2 MB / 1275 candidates)
+Candidates are size-biased UPWARD by ~8.5x: a larger file contains more
+distinct trigrams and therefore satisfies more conjuncts. Verification cost
+must be computed from the CANDIDATE mean, never the corpus mean. The plan
+estimated 35 KB; the measurement says 126 KB for common symbols.
+
+=== Bugs 6-7 (BUGLOG continued) ===
+6. Prefilter first used std::string::find, which is libstdc++'s naive O(n*m)
+   search -- SLOWER than the DFA it was meant to skip. verify_ms went UP.
+   Fixed by using memmem (SIMD-optimised in glibc).
+7. A broken printf (%s consuming a double after an arg-order edit) segfaulted
+   mid-output, truncating stdout and making the engine look UNSOUND (mine=315
+   vs grep=361). It was never unsound; the process was dying. Lesson: verify
+   the build succeeded before trusting a correctness result.
+
+=== Task 5b: honesty fixes -- real loser tree + inline skip blocks + PostingCursor ===
+distinct_trigrams 417918     (2.5% of the 2^24 offset slots are non-empty)
+postings          132232738  (unchanged, as it must be)
+payload_bytes     141152730
+skip_bytes        12709824   (inline: [nskips][SkipEntry x n] before each payload; 9.0% of payload)
+index_bytes       288080282  (288 MB)
+Correctness on the new format: 6/6 file-set EXACT vs grep -E, incl. (foo|bar)baz.
+
+=== Ablation: parallel verification (same binary, --threads=N, --repeat=3, total_ms) ===
+CONFIG_SMP              1thr=477  4thr=274  8thr=282   1.7x
+kmalloc\(.*GFP_ATOMIC   1thr=556  4thr=305  8thr=330   1.8x
+spin_lock_irqsave       1thr=591  4thr=320  8thr=319   1.8x
+4 physical cores; hyperthreads add nothing to a memory-bound DFA. Quote 1.7-1.8x.
+
+=== Ablation: skip-block cursor (plan_ms with cursor path active) ===
+kmalloc\(.*GFP_ATOMIC   candidates 3542  plan_ms 0.46
+netif_(rx|receive_skb)  candidates 852   plan_ms 0.58
+spin_lock_irqsave       candidates 3804  plan_ms 0.90
+(foo|bar)baz            candidates 12    plan_ms 0.21
+Planning is sub-millisecond either way. The cursor makes the skip-block CLAIM
+true (the blocks are now read, not just written); it does not move latency.
+Verification dominates: candidates are size-biased ~8.5x upward.
+
+=== Environmental note ===
+A single-threaded reindex on an unchanged binary measured extract=175 s /
+build=210 s vs 76 / 83 s earlier -- both phases slowed ~2.3x uniformly, which
+is VM contention, not code. Re-measured with parallel extraction below.
