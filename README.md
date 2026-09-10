@@ -2,7 +2,8 @@
 
 Indexed regex search over a source tree. Ask an arbitrary regex over the
 1.2 GB Linux kernel tree and get the matching files from an index in about
-**10 ms**, instead of scanning the corpus on every query.
+**10 ms** (median, index resident, warm cache), instead of scanning the corpus
+on every query.
 
 Written from scratch in C++17: the index format, the external sort, the regex
 engine, and the query planner. Measured, not modelled — see
@@ -73,6 +74,24 @@ Useful flags for `trigrep_search`: `--threads=N`, `--repeat=N` (amortise
 process startup; a service keeps the index resident), `--no-prefilter`
 (ablation), `--debug` (print the synthesised query and required literals),
 `--patterns-file=F` (one process, many queries — used by the oracle).
+
+`make check` runs an end-to-end smoke test on a synthetic corpus with exact
+assertions (literal, alternation, UTF-8 `.`, degrade-to-`ANY`, batch mode);
+CI runs it on every push.
+
+## Reproduce the numbers
+
+```bash
+curl -O https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
+sha256sum -c corpus_sha256.txt && tar xf linux-6.6.tar.xz
+./build/count_trigrams linux-6.6                     # 81,664 files, 132.2M postings
+./build/trigrep_index  linux-6.6 index               # ~288 MB, prints build time and peak RSS
+python3 harness/bench.py harness/heldout.txt linux-6.6 index    # needs ripgrep on PATH
+pip install google-re2 && python3 harness/oracle.py index shard 2000 1 2 1
+```
+
+Numbers in [RESULTS.md](RESULTS.md) were taken on WSL2 (2 vCPU) and an AWS
+`c5.xlarge`; absolute times will differ on other hardware, ratios should not.
 
 ## Regex support
 

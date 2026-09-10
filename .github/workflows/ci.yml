@@ -1,0 +1,16 @@
+name: build and smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: make
+      - name: smoke test (synthetic corpus, exact assertions)
+        run: make check

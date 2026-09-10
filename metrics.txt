@@ -236,4 +236,4 @@ harness bug (deadlock)  tier A hung 2.3 h at 0% CPU, no engine child, no output:
 
 === Task 9 tier A, post-fix, harness deadlock fixed (10K, seed 2) -- CLEAN ===
 oracle=google-re2 tier=shard files=2000 checked=10000 skipped=0 mismatches=0 unsound=0 engine_s=770 oracle_s=175
-This is the number bullet 4 quotes. Tier 0 (2,000, pre-fix) is a separate row.
+Tier 0 (2,000, pre-fix) is a separate row.

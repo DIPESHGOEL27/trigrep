@@ -120,3 +120,8 @@ cost a rerun.
 - **LSM-style segments** for incremental re-indexing.
 - The workload has no class-only patterns, so it never exercises the
   degrade-to-`ANY` fallback; a fallback rate is therefore not claimed.
+- Two planner constants — `kSelectivityCap = 0.25` (drop a conjunct covering
+  more than a quarter of the corpus) and `kCursorRatio = 8` (seek through
+  skip blocks when a list is 8× longer than the accumulator) — are plausible
+  defaults, not tuned values. The train/held-out split exists so they *could*
+  be tuned on train alone; that sweep was not run.

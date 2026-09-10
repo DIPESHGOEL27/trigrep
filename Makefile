@@ -14,9 +14,12 @@ build/%.o: %.cpp
 build/%: build/tools/%.o $(LIBOBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
+check: all
+	@bash tests/smoke.sh
+
 clean:
 	rm -rf build
 
 .PRECIOUS: build/%.o build/tools/%.o
-.PHONY: all clean
+.PHONY: all check clean
 -include $(shell find build -name '*.d' 2>/dev/null)

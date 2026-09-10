@@ -1,7 +1,7 @@
 #!/bin/bash
 # EC2 user-data for the Task 11 scaling run.
 #
-# Proves the resume claim that peak RSS is bounded by (threads x run buffer +
+# Proves the claim that peak RSS is bounded by (threads x run buffer +
 # offset table) and is INDEPENDENT of corpus size: the identical binary indexes
 # Linux alone (~1.2 GB) and then Linux+LLVM+PostgreSQL+CPython (~5 GB), and the
 # two peak-RSS figures should be within noise of each other.
