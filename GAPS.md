@@ -94,3 +94,12 @@ number after the bullets were sized, and it is a better *interview answer*
    confirm the build succeeded before trusting a correctness result.
 5. `is_regular_file()` follows symlinks; `grep -r` and ripgrep don't. One-file
    over-return — the safe direction, but not comparable to the baseline.
+6. **Found by the oracle, not by grep-diffing — the first one.** Tier A (10,000
+   generated regexes) reported one mismatch: `(gre|(a)+.[mpwz])` missed
+   `mxs-pinfunc.h`, where RE2 matched `'aßm'`. ß is two UTF-8 bytes (C3 9F);
+   RE2 and ripgrep match `.` against one *code point*, my DFA matched one
+   *byte*, so `[mpwz]` was tested against 0x9F. Synthesis was sound — the file
+   was a candidate; the verifier was wrong. Fixed the way RE2 does it: `.` and
+   any class admitting a byte ≥ 0x80 compile to the UTF-8 sequence automaton.
+   A 1-in-10,000 case that 100 hand-picked kernel queries never exercised —
+   which is the entire argument for a generated-regex oracle over a curated one.
