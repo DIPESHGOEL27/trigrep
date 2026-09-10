@@ -140,7 +140,7 @@ CORRECTION to earlier note: the ~28x CPU ratio was measurement error
 81,664 lines of docs.txt to every query). Steady-state per-query CPU is
 0.017 s; 1.96 / 0.017 = 115x.
 
-=== Task 11: scaling run launched (AWS 977098995841, us-east-1, profile dipesh-correct) ===
+=== Task 11: scaling run launched (AWS <aws-account>, us-east-1, profile dipesh-correct) ===
 instance          i-09a934dbe2bd06281   spot c5.xlarge (4 vCPU / 8 GB)  us-east-1d
 ami               ami-025d99823a4caad37 (Ubuntu 24.04, Canonical, 2026-09-04)
 storage           50 GB gp3, DeleteOnTermination; instance-initiated-shutdown -> terminate
@@ -221,3 +221,15 @@ fix verified      one-file index of mxs-pinfunc.h, engine vs google-re2 on 8 pro
                   (gre|(a)+.[mpwz]) 1/1   a.[mpwz] 1/1   a.m 1/1   a..m 0/0   a[^x]m 1/1
                   Wa.mann 1/1   Wa..mann 0/0   W.ßm 1/1      (nfa_states 9 -> 21 for the UTF-8 automaton)
                   The 0/0 negatives are the proof: `.` now consumes exactly one code point, not one byte and not two.
+
+=== Task 9 tier A rerun on the fixed binary (10K, seed 2): engine 827.9 s, 0 MISMATCH / 0 UNSOUND ...
+    ... but the oracle pool phase was OOM-KILLED both times (dmesg: "Killed process (python3) anon-rss 2.37 GB").
+harness root cause  the WSL VM has 3.9 GB RAM; capture_output=True slurped the engine's whole stdout
+                    (10K patterns x up to 2,000 paths ~ 1.6 GB) and each result was kept as a set of
+                    path strings. Fixed: stream stdout line by line, encode each result as ONE Python
+                    int bitmask over the shard files (~250 B/pattern); oracle returns the same encoding.
+
+WSL service crashed during the memory-safe tier A rerun: "Catastrophic failure / Wsl/Service/E_UNEXPECTED" (Windows-side, not the harness). Restarting WSL.
+harness bug (deadlock)  tier A hung 2.3 h at 0% CPU, no engine child, no output: Popen with BOTH stdout and
+                        stderr piped; the engine writes a stats line per pattern to stderr; the harness drained
+                        stdout to EOF first, the 64 KB stderr pipe filled, both blocked. Fixed: stderr -> file.

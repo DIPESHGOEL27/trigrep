@@ -2,3 +2,7 @@ build/
 index*/
 corpus/
 runs/
+*.o
+*.d
+__pycache__/
+*.pyc
