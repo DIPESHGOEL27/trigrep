@@ -9,9 +9,10 @@ numbers are whole-process.
 
 Every query's file set is also diffed against ripgrep's, so the benchmark
 doubles as a full-corpus correctness check. ripgrep runs with --no-ignore
---hidden so it searches the same files the indexer walked.
+--hidden --max-filesize 8M so it searches exactly the files the indexer walks
+(the indexer skips files over 8 MB, such as 24 MB AMD register headers).
 
-usage: bench.py <queries.txt> <corpus> <index> [--reps=5] [--threads=4]
+usage: bench.py <queries.txt> <corpus> <index> [--reps=5] [--threads=2]
 """
 import os
 import re
@@ -60,7 +61,7 @@ def main(qfile, corpus, index, reps, threads):
 
         walls, cpus, theirs = [], [], set()
         for _ in range(reps):
-            w, c, o, _ = run(["rg", "-l", "--no-ignore", "--hidden", "--no-messages", "-e", pat, corpus])
+            w, c, o, _ = run(["rg", "-l", "--no-ignore", "--hidden", "--max-filesize", "8M", "--no-messages", "-e", pat, corpus])
             walls.append(w)
             cpus.append(c)
             theirs = files(o)
@@ -93,4 +94,4 @@ if __name__ == "__main__":
     opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
     if len(args) != 3:
         sys.exit(__doc__)
-    main(args[0], args[1], args[2], int(opts.get("reps", 5)), int(opts.get("threads", 4)))
+    main(args[0], args[1], args[2], int(opts.get("reps", 5)), int(opts.get("threads", 2)))
