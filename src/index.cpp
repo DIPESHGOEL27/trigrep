@@ -177,17 +177,24 @@ PostingCursor::PostingCursor(const IndexReader& ix, Trigram t) {
     if (!count_) return;
     const uint8_t* rec = ix.record(t);
     std::memcpy(&nskips_, rec, sizeof nskips_);
-    skips_   = reinterpret_cast<const SkipEntry*>(rec + sizeof nskips_);
+    skips_   = rec + sizeof nskips_;
     payload_ = rec + sizeof nskips_ + nskips_ * sizeof(SkipEntry);
     jump_to_block(0);
 }
 
+SkipEntry PostingCursor::skip(uint32_t b) const {
+    SkipEntry e;
+    std::memcpy(&e, skips_ + size_t(b) * sizeof(SkipEntry), sizeof e);
+    return e;
+}
+
 void PostingCursor::jump_to_block(uint32_t b) {
     block_ = b;
-    off_   = skips_[b].byte_off;
+    const SkipEntry e = skip(b);
+    off_   = e.byte_off;
     idx_   = b * kSkipStride;
     get_uvarint(payload_, off_);            // consume the block's first delta...
-    cur_   = skips_[b].first;               // ...its absolute value is in the skip entry
+    cur_   = e.first;               // ...its absolute value is in the skip entry
 }
 
 void PostingCursor::seek(DocId target) {
@@ -196,7 +203,7 @@ void PostingCursor::seek(DocId target) {
     uint32_t lo = block_, hi = nskips_;      // never move backwards
     while (hi - lo > 1) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (skips_[mid].first <= target) lo = mid; else hi = mid;
+        if (skip(mid).first <= target) lo = mid; else hi = mid;
     }
     if (lo != block_) jump_to_block(lo);
     if (cur_ >= target) return;

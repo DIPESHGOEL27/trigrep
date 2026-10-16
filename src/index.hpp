@@ -47,8 +47,12 @@ public:
     void  seek(DocId target);          // advance to first docid >= target
 private:
     void jump_to_block(uint32_t b);
+    SkipEntry skip(uint32_t b) const;
     const uint8_t*   payload_ = nullptr;
-    const SkipEntry* skips_   = nullptr;
+    // Records start at arbitrary byte offsets (payloads are varints), so the
+    // skip array is not aligned: entries are memcpy'd out, never dereferenced
+    // through a SkipEntry*. UBSan caught the misaligned read.
+    const uint8_t*   skips_   = nullptr;
     uint32_t nskips_ = 0, count_ = 0, idx_ = 0, block_ = 0;
     size_t   off_ = 0;
     DocId    cur_ = 0;
