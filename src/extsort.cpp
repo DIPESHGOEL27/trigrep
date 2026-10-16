@@ -1,8 +1,10 @@
 #include "extsort.hpp"
 
-// LSD radix sort, 8 passes of 8 bits. Non-comparison, O(n) per pass.
-static void radix_sort_u64(std::vector<Pair>& v) {
-    std::vector<Pair> tmp(v.size());
+// LSD radix sort, 8 passes of 8 bits. Non-comparison, O(n) per pass. `tmp` is
+// the ping-pong buffer; after the 8th (even) swap both vectors own their
+// original storage again, so a shared scratch keeps its capacity.
+static void radix_sort_u64(std::vector<Pair>& v, std::vector<Pair>& tmp) {
+    tmp.resize(v.size());
     for (int shift = 0; shift < 64; shift += 8) {
         size_t cnt[256] = {0};
         for (Pair p : v) ++cnt[(p >> shift) & 0xFF];
@@ -14,7 +16,17 @@ static void radix_sort_u64(std::vector<Pair>& v) {
 }
 
 void RunWriter::spill() {
-    radix_sort_u64(buf_);
+    if (scratch_) {
+        // One 256 MB scratch for all threads: sorts take turns, writes do
+        // not. Peak memory is (threads + 1) x 256 MB instead of threads x
+        // 512 MB, which matters because threads pulling from one work queue
+        // fill their buffers at the same rate and spill at the same moment.
+        std::lock_guard<std::mutex> lock(scratch_->m);
+        radix_sort_u64(buf_, scratch_->buf);
+    } else {
+        std::vector<Pair> tmp;
+        radix_sort_u64(buf_, tmp);
+    }
     char name[512];
     std::snprintf(name, sizeof name, "%s/run_t%u_%03zu.bin", dir_.c_str(), tag_, runs_.size());
     std::FILE* f = std::fopen(name, "wb");

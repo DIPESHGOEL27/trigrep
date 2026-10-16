@@ -53,13 +53,15 @@ void IndexWriter::build(const std::string& root, const std::string& out) {
     // merge stage takes the union of every thread's spilled runs: the k-way
     // merge does not care which thread produced a run.
     //
-    // Memory: each thread holds a 256 MB run buffer, and radix sort needs a
-    // second 256 MB scratch buffer while it spills, so the bound is
-    // threads x 512 MB + the 134 MB offset table + per-file bookkeeping.
+    // Memory: each thread holds a 256 MB run buffer, and the radix sort's
+    // 256 MB ping-pong buffer is ONE shared scratch that spills take turns
+    // on, so the bound is (threads + 1) x 256 MB + the 134 MB offset table +
+    // per-file bookkeeping.
     unsigned nthreads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    SpillScratch scratch;
     std::vector<std::unique_ptr<RunWriter>> writers;
     for (unsigned t = 0; t < nthreads; ++t)
-        writers.emplace_back(std::make_unique<RunWriter>(runs_dir, t));
+        writers.emplace_back(std::make_unique<RunWriter>(runs_dir, t, &scratch));
     {
         std::vector<std::thread> pool;
         std::atomic<size_t> next_file{0};
