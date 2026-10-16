@@ -58,76 +58,104 @@ static TriQuery or_tris_of_set(const std::set<std::string>& S) {
     return or_of(std::move(v));
 }
 
-// Capped cross product. Returns false if it would exceed the cap; the caller
-// then degrades to ANY rather than keeping a truncated (unsound) set.
-static bool cross(const std::set<std::string>& A, const std::set<std::string>& B,
-                  std::set<std::string>& out) {
+// ---- the four-tuple -------------------------------------------------------
+// Invariants (every one is what makes the result a superset):
+//   ex   when `exact`: the complete, finite set of strings the node matches.
+//   pre  strings of which EVERY match starts with one (kept to <= 2 bytes);
+//   suf  strings of which EVERY match ends with one (kept to <= 2 bytes).
+//   An EMPTY pre/suf set means UNKNOWN, never "no strings". The original
+//   alternation rule unioned sets and so read "unknown" as "nothing", which
+//   made (abc|x.*)def demand the trigram "bcd" and silently drop true matches.
+// Two bytes are all a join needs: a trigram straddling a concatenation takes
+// at most 2 bytes from either side; trigrams inside a side are already in
+// that side's query.
+static constexpr size_t kExactMaxLen = 32;   // longer exact strings are demoted
+
+static std::string first2(const std::string& s) { return s.substr(0, std::min<size_t>(2, s.size())); }
+static std::string last2(const std::string& s)  { return s.substr(s.size() - std::min<size_t>(2, s.size())); }
+
+// out = { f(a + b) : a in A, b in B }. False if either side is unknown or the
+// result would exceed the cap; the caller then treats the result as unknown.
+template <class F>
+static bool product(const std::set<std::string>& A, const std::set<std::string>& B,
+                    F f, std::set<std::string>& out) {
+    out.clear();
     if (A.empty() || B.empty()) return false;
     for (const auto& a : A) for (const auto& b : B) {
-        std::string s = a + b;
-        if (s.size() > 16) s = s.substr(s.size() - 16);   // bounded suffix window
-        out.insert(s);
-        if (out.size() > kSetCap) return false;
+        out.insert(f(a + b));
+        if (out.size() > kSetCap) { out.clear(); return false; }
     }
     return true;
 }
+static std::string ident(const std::string& s) { return s; }
 
 static Info info_any() { Info i; i.exact = false; i.q = TriQuery::any(); return i; }
 
+static Info info_exact(std::set<std::string> ex, TriQuery q) {
+    Info i; i.q = std::move(q);
+    size_t longest = 0;
+    for (const auto& s : ex) longest = std::max(longest, s.size());
+    for (const auto& s : ex) { i.pre.insert(first2(s)); i.suf.insert(last2(s)); }
+    if (ex.size() <= kSetCap && longest <= kExactMaxLen) { i.exact = true; i.ex = std::move(ex); }
+    if (i.pre.size() > kSetCap) i.pre.clear();
+    if (i.suf.size() > kSetCap) i.suf.clear();
+    return i;
+}
+
+static Info concat2(const Info& a, const Info& b) {
+    std::vector<TriQuery> qs{a.q, b.q};
+    std::set<std::string> joins;               // last2(suffix) + first2(prefix)
+    if (product(a.suf, b.pre, ident, joins)) qs.push_back(or_tris_of_set(joins));
+    TriQuery q = and_of(std::move(qs));
+
+    std::set<std::string> ex;
+    if (a.exact && b.exact && product(a.ex, b.ex, ident, ex)) return info_exact(std::move(ex), std::move(q));
+
+    Info r; r.exact = false; r.q = std::move(q);
+    if (!a.exact) r.pre = a.pre;
+    else if (!product(a.ex, b.pre, first2, r.pre)) for (const auto& x : a.ex) r.pre.insert(first2(x));
+    if (!b.exact) r.suf = b.suf;
+    else if (!product(a.suf, b.ex, last2, r.suf)) for (const auto& y : b.ex) r.suf.insert(last2(y));
+    if (r.pre.size() > kSetCap) r.pre.clear();
+    if (r.suf.size() > kSetCap) r.suf.clear();
+    return r;
+}
+
 static Info walk(const Node* n) {
     switch (n->op) {
-    case Op::Empty: {
-        Info i; i.exact = true; i.ex = {""}; i.pre = {""}; i.suf = {""}; return i; }
-    case Op::Literal: {
-        Info i; i.exact = true; i.ex = {n->lit}; i.pre = {n->lit}; i.suf = {n->lit};
-        i.q = tris_of(n->lit); return i; }
+    case Op::Empty:
+    case Op::Bol:                                // anchors consume nothing
+    case Op::Eol:
+        return info_exact({""}, TriQuery::any());
+    case Op::Literal:
+        return info_exact({n->lit}, tris_of(n->lit));
     case Op::Class: {
         if (n->cls.count() > kSetCap) return info_any();     // '.' and big classes -> ANY
-        Info i; i.exact = true;
-        for (int c = 0; c < 256; ++c) if (n->cls.test(size_t(c))) {
-            std::string s(1, char(c)); i.ex.insert(s); i.pre.insert(s); i.suf.insert(s);
-        }
-        return i; }                                          // single bytes carry no trigram
+        std::set<std::string> ex;
+        for (int c = 0; c < 256; ++c) if (n->cls.test(size_t(c))) ex.insert(std::string(1, char(c)));
+        return info_exact(std::move(ex), TriQuery::any()); } // single bytes carry no trigram
     case Op::Concat: {
         Info acc = walk(n->kids[0]);
-        for (size_t k = 1; k < n->kids.size(); ++k) {
-            Info b = walk(n->kids[k]);
-            Info r;
-            std::vector<TriQuery> qs{acc.q, b.q};
-            // Trigrams that STRADDLE the join: left suffixes x right prefixes.
-            std::set<std::string> straddle;
-            if (cross(acc.suf, b.pre, straddle)) qs.push_back(or_tris_of_set(straddle));
-            r.q = and_of(std::move(qs));
-            if (acc.exact && b.exact && cross(acc.ex, b.ex, r.ex)) {
-                r.exact = true; r.pre = r.ex; r.suf = r.ex;
-            } else {
-                r.exact = false;
-                if (acc.exact) { if (!cross(acc.ex, b.pre, r.pre)) r.pre.clear(); }
-                else r.pre = acc.pre;
-                if (b.exact)   { if (!cross(acc.suf, b.ex, r.suf)) r.suf.clear(); }
-                else r.suf = b.suf;
-            }
-            if (r.ex.size() > kSetCap)  { r.exact = false; r.ex.clear(); }
-            if (r.pre.size() > kSetCap) r.pre.clear();
-            if (r.suf.size() > kSetCap) r.suf.clear();
-            acc = std::move(r);
-        }
+        for (size_t k = 1; k < n->kids.size(); ++k) acc = concat2(acc, walk(n->kids[k]));
         return acc; }
     case Op::Alt: {
         Info r; r.exact = true;
+        bool pre_known = true, suf_known = true;
         std::vector<TriQuery> qs;
         for (Node* k : n->kids) {
             Info b = walk(k);
             qs.push_back(b.q);
             r.exact = r.exact && b.exact;
-            r.ex.insert(b.ex.begin(), b.ex.end());
+            if (b.exact) r.ex.insert(b.ex.begin(), b.ex.end());
+            pre_known = pre_known && !b.pre.empty();
+            suf_known = suf_known && !b.suf.empty();
             r.pre.insert(b.pre.begin(), b.pre.end());
             r.suf.insert(b.suf.begin(), b.suf.end());
         }
         r.q = or_of(std::move(qs));
-        if (r.ex.size()  > kSetCap) { r.exact = false; r.ex.clear(); }
-        if (r.pre.size() > kSetCap) r.pre.clear();
-        if (r.suf.size() > kSetCap) r.suf.clear();
+        if (!r.exact || r.ex.size() > kSetCap) { r.exact = false; r.ex.clear(); }
+        if (!pre_known || r.pre.size() > kSetCap) r.pre.clear();     // one unknown branch
+        if (!suf_known || r.suf.size() > kSetCap) r.suf.clear();     // makes the whole set unknown
         return r; }
     case Op::Star:
     case Op::Quest:
@@ -184,7 +212,8 @@ static void req_walk(const Node* n, std::vector<std::string>& out) {
     case Op::Plus: req_walk(n->kids[0], out); return;
     case Op::Repeat: if (n->rmin >= 1) req_walk(n->kids[0], out); return;
     case Op::Alt:    return;   // branches may differ -- contribute nothing
-    case Op::Star: case Op::Quest: case Op::Class: case Op::Empty: return;
+    case Op::Star: case Op::Quest: case Op::Class: case Op::Empty:
+    case Op::Bol: case Op::Eol: return;
     }
 }
 
