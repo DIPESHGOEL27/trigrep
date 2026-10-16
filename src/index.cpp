@@ -12,6 +12,11 @@
 #include <cstring>
 #include <thread>
 #include <memory>
+#include <atomic>
+
+// Written last by the builder, checked first by the reader. A crashed or
+// partial build therefore has no marker and is refused instead of mmapped.
+static const char* kFormatTag = "trigrep-index 1";
 
 static const void* map_file(const std::string& p, size_t& len) {
     int fd = ::open(p.c_str(), O_RDONLY);
@@ -33,26 +38,35 @@ void IndexWriter::build(const std::string& root, const std::string& out) {
     ::mkdir(runs_dir.c_str(), 0755);
 
     auto files = walk_corpus(root);
+    ::unlink((out + "/format").c_str());          // invalid until the build completes
+    for (const auto& f : files)
+        if (f.path.find('\n') != std::string::npos) fatal("path contains a newline: docs.txt is line-based");
     { std::ofstream d(out + "/docs.txt");
-      for (const auto& f : files) d << f.path << '\n'; }
+      for (const auto& f : files) d << f.path << '\n';
+      d.close();
+      if (!d) fatal("write failed: docs.txt"); }
 
     // Extraction is embarrassingly parallel per file. Each thread owns a
-    // TrigramSet (the 2 MB bitset), a RunWriter, and a contiguous file range,
-    // so there is no shared mutable state and no locking. The merge stage
-    // simply takes the union of every thread's spilled runs -- the k-way
+    // TrigramSet (the 2 MB bitset) and a RunWriter, and pulls the next file
+    // index from one shared atomic counter, so a directory of huge files
+    // cannot stall a single thread the way a fixed contiguous range did. The
+    // merge stage takes the union of every thread's spilled runs: the k-way
     // merge does not care which thread produced a run.
+    //
+    // Memory: each thread holds a 256 MB run buffer, and radix sort needs a
+    // second 256 MB scratch buffer while it spills, so the bound is
+    // threads x 512 MB + the 134 MB offset table + per-file bookkeeping.
     unsigned nthreads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
     std::vector<std::unique_ptr<RunWriter>> writers;
     for (unsigned t = 0; t < nthreads; ++t)
         writers.emplace_back(std::make_unique<RunWriter>(runs_dir, t));
     {
         std::vector<std::thread> pool;
-        size_t per = (files.size() + nthreads - 1) / nthreads;
+        std::atomic<size_t> next_file{0};
         for (unsigned t = 0; t < nthreads; ++t) {
             pool.emplace_back([&, t]() {
                 TrigramSet ts; std::vector<Trigram> buf;
-                size_t lo = t * per, hi = std::min(files.size(), lo + per);
-                for (size_t i = lo; i < hi; ++i) {
+                for (size_t i; (i = next_file.fetch_add(1)) < files.size(); ) {
                     std::string text = slurp(files[i].path);
                     buf.clear();
                     ts.collect(text, buf);
@@ -100,8 +114,16 @@ void IndexWriter::build(const std::string& root, const std::string& out) {
         }
         flush();
     }
+    fp.close();
+    if (!fp) fatal("write failed: postings.bin (disk full?)");
     { std::ofstream fo(out + "/offsets.bin", std::ios::binary);
-      fo.write(reinterpret_cast<const char*>(off.data()), long(off.size() * sizeof(OffRec))); }
+      fo.write(reinterpret_cast<const char*>(off.data()), long(off.size() * sizeof(OffRec)));
+      fo.close();
+      if (!fo) fatal("write failed: offsets.bin (disk full?)"); }
+    { std::ofstream ft(out + "/format");
+      ft << kFormatTag << '\n';
+      ft.close();
+      if (!ft) fatal("write failed: format"); }
 
     for (const auto& r : all_runs) ::unlink(r.c_str());
     ::rmdir(runs_dir.c_str());
@@ -126,8 +148,13 @@ void IndexWriter::build(const std::string& root, const std::string& out) {
 }
 
 bool IndexReader::open(const std::string& dir) {
+    { std::ifstream ft(dir + "/format");
+      std::string tag;
+      if (!std::getline(ft, tag) || tag != kFormatTag)
+          fatal("not a complete trigrep index (missing or wrong format marker): " + dir); }
     size_t olen = 0;
     off_  = static_cast<const OffRec*>(map_file(dir + "/offsets.bin", olen));
+    if (olen != sizeof(OffRec) * size_t(kTrigramSpace)) fatal("offsets.bin has the wrong size: " + dir);
     post_ = static_cast<const uint8_t*>(map_file(dir + "/postings.bin", post_len_));
     std::ifstream d(dir + "/docs.txt");
     std::string line;

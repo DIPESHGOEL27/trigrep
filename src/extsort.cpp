@@ -18,9 +18,12 @@ void RunWriter::spill() {
     char name[512];
     std::snprintf(name, sizeof name, "%s/run_t%u_%03zu.bin", dir_.c_str(), tag_, runs_.size());
     std::FILE* f = std::fopen(name, "wb");
-    if (!f) fatal("cannot open run file");
-    std::fwrite(buf_.data(), sizeof(Pair), buf_.size(), f);
-    std::fclose(f);
+    if (!f) fatal(std::string("cannot open run file ") + name);
+    // A short write (disk full) must stop the build: a truncated run would
+    // silently drop postings, and a missing posting is an UNSOUND index.
+    size_t wrote = std::fwrite(buf_.data(), sizeof(Pair), buf_.size(), f);
+    if (wrote != buf_.size() || std::fclose(f) != 0)
+        fatal(std::string("short write to run file (disk full?) ") + name);
     runs_.emplace_back(name);
     buf_.clear();
 }
@@ -61,6 +64,7 @@ bool RunMerger::refill(size_t i) {
     if (s.eof) return false;
     s.len = std::fread(s.buf.data(), sizeof(Pair), kSrcBuf, s.f);
     s.pos = 0;
+    if (std::ferror(s.f)) fatal("read error on run file");
     if (s.len == 0) { s.eof = true; return false; }
     return true;
 }
