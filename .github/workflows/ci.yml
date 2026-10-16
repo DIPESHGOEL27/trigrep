@@ -14,3 +14,5 @@ jobs:
         run: make
       - name: smoke test (synthetic corpus, exact assertions)
         run: make check
+      - name: same smoke test under ASan + UBSan
+        run: make sanitize
