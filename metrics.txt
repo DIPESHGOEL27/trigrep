@@ -237,3 +237,81 @@ harness bug (deadlock)  tier A hung 2.3 h at 0% CPU, no engine child, no output:
 === Task 9 tier A, post-fix, harness deadlock fixed (10K, seed 2) -- CLEAN ===
 oracle=google-re2 tier=shard files=2000 checked=10000 skipped=0 mismatches=0 unsound=0 engine_s=770 oracle_s=175
 Tier 0 (2,000, pre-fix) is a separate row.
+
+
+=== 2026-10-16: REVIEW, FIXES, RERUN (WSL2, 2 vCPU, 3.9 GB) ===
+A code review found bugs the v1 oracle could not reach. Each was reproduced
+before it was fixed.
+
+repro (pre-fix binary vs grep -P, synthetic corpus):
+  (abc|x.*)def     trigrep=[b.c]  grep=[a.c b.c]        candidates 1    <- UNSOUND
+  (abc|x*)def      trigrep=[b.c]  grep=[a.c b.c d.c]
+  foo(bar|.*)      trigrep=[g.c]  grep=[b.c e.c g.c]
+  [\d]             trigrep=[a.c b.c d.c f.c]  grep=[a.c e.c]   (read as the letter d)
+  \bfoo            trigrep=[]  grep=[b.c e.c]                  (read as the letter b)
+  ^#include        trigrep=[f.c]  grep=[]                       (anchor ignored)
+  DFA flush, cache cut to 6 states: a[ab]{6}c found 1 of 20 files (python re: 20)
+  (((ab){512}){512}){512}: 137 s, then std::bad_alloc
+
+v1 generator coverage, from the September tier A engine log:
+  10,000 patterns: 66.4% degraded to ANY, 20.4% matched no file,
+  0 patterns with a group directly next to a literal or class.
+
+=== oracle v2 (new generator), 2,000-file strict-UTF-8 shard, seed 1 ===
+shard ~/tg/shard2: 2000 files, 26547038 bytes; index files 2000 postings 3312820 build_s 1.9
+PRE-FIX binary : oracle=google-re2 files=2000 checked=10000 mismatches=568 unsound=241
+                 superset_check=count-only degraded_to_ANY=4818 nonempty_answer=5036 engine_s=864 oracle_s=758
+FIXED binary   : oracle=google-re2 files=2000 checked=10000 mismatches=0 unsound=0
+                 superset_check=exact skipped_by_re2=0 rejected_by_engine=0 degraded_to_ANY=3788
+                 nonempty_answer=5036 engine_s=736 oracle_s=765
+pre-fix failures by pattern feature (heuristic split):
+  UNSOUND   alternation / straddle                   121
+  UNSOUND   escape misread (\D \W \S, or \d in [])  85
+  UNSOUND   anchor ignored                           35
+  MISMATCH  anchor ignored                           396
+  MISMATCH  escape misread                           140
+  MISMATCH  alternation / straddle                   32
+
+=== sanitizers ===
+make check: all assertions pass. make sanitize (ASan + UBSan, -fno-sanitize-recover): pass.
+first 1,000-pattern ASan/UBSan oracle run: aborted at pattern 22 --
+  src/index.cpp:187: runtime error: member access within misaligned address
+  for type 'const struct SkipEntry', which requires 4 byte alignment
+  (PostingCursor::jump_to_block). Fixed with memcpy; the new smoke query
+  'rarezq common_word' fails under make sanitize on the pre-fix code.
+after fix: checked=1000 mismatches=0 unsound=0 superset_check=exact, 0 sanitizer reports
+
+=== DFA throughput, old vs new binary back to back, best of 3, 960 KB of random a/b text ===
+a[ab]{10}c   old 51.06 ms   new 23.5 ms
+a[ab]{13}c   old 317.57 ms  new 88.27 ms
+a[ab]{16}c   old 3270.26 ms new 836.26 ms   (2^17 live states; byte classes + 64 MB budget + NFA fallback)
+correctness with the cache cut to ~10 states: all 7 probe patterns equal python re (were 1/20, 1/7, ...)
+
+=== indexer, Linux 6.6, warm cache, back to back ===
+pre-fix builder : runs 5 (2 threads) build_s 64.5 peak_rss_mb 892
+current builder : runs 5 (2 threads) build_s 62.5 peak_rss_mb 918
+postings 132232738, index_bytes 288080282: postings.bin, offsets.bin, docs.txt byte-identical.
+(before the shared radix scratch, the work-queue builder peaked at 1071 MB: both threads spilled at once)
+
+=== DISCARDED: first October benchmark (host under load) ===
+ident: trigrep p50 22.9 ms cpu 0.0395 s | ripgrep p50 1793 ms cpu 3.99 s | 101x cpu 78x wall | diffs 0/100
+regex: trigrep p50 21.4 ms cpu 0.0369 s | ripgrep p50 1790 ms cpu 3.86 s | 104x cpu 84x wall | diffs 0/100
+ripgrep itself ran 2.3x slower than in the final run; the WSL VM failed to start
+minutes later (HCS_E_CONNECTION_TIMEOUT). Not used. An even earlier attempt had
+3 file-set diffs, all files over 8 MB (24 MB and 11 MB AMD register headers)
+that the indexer skips by design; ripgrep now gets --max-filesize 8M.
+
+=== FINAL BENCHMARK, current binary: 5 runs per query for BOTH tools, best wall, mean CPU ===
+ripgrep: -l --no-ignore --hidden --max-filesize 8M; trigrep: --threads=2 --repeat=5
+identifiers (harness/heldout.txt):
+  candidates_median 46  candidates_p90 1127  fallback_to_scan 0/100
+  trigrep_p50_ms 9.8  trigrep_p95_ms 803.2  trigrep_cpu_s_med 0.0135
+  ripgrep_p50_ms 781.3  ripgrep_p95_ms 1090.8  ripgrep_cpu_s_med 1.7058
+  cpu_ratio_median 126x  wall_ratio_median 80x  file_set_diffs_vs_ripgrep 0/100
+regexes (harness/regex_workload.py over heldout.txt):
+  candidates_median 52  candidates_p90 1127  fallback_to_scan 0/100
+  trigrep_p50_ms 10.8  trigrep_p95_ms 737.2  trigrep_cpu_s_med 0.0179
+  ripgrep_p50_ms 822.2  ripgrep_p95_ms 1612.2  ripgrep_cpu_s_med 1.9220
+  cpu_ratio_median 107x  wall_ratio_median 76x  file_set_diffs_vs_ripgrep 0/100
+CORRECTION: the September benchmark labelled its run "4 threads"; bench.py
+passed no --threads, so the engine used its default, 2 (hardware_concurrency).

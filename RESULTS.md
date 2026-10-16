@@ -11,8 +11,9 @@ append-only log is [`metrics.txt`](metrics.txt); this file is the summary.
 | Indexed content | **81,664 files, 1.21 GB** after skipping binaries, files > 8 MB, and symlinks |
 | Build machine | WSL2 Ubuntu 24.04, 2 vCPU, 3.9 GB RAM, ext4; `g++ 13.3 -O2 -march=native` |
 | Scaling machine | AWS spot `c5.xlarge`, 4 vCPU, 8 GB, Ubuntu 24.04 |
-| Baseline | ripgrep 14.1.0, 8 threads, `--no-ignore`, warm page cache |
-| Oracle | google-re2 (Python bindings), file-set equality |
+| Baseline | ripgrep 14.1.0, default threads, `--no-ignore --hidden --max-filesize 8M` (the files the indexer walks), warm page cache |
+| Oracle | google-re2 (Python bindings), multi-line anchors, file-set equality, exact superset check |
+| Sanitizers | `make sanitize`: smoke test under ASan + UBSan, in CI; 1,000 oracle patterns under both, 0 reports |
 
 ## Index build
 
@@ -24,14 +25,28 @@ append-only log is [`metrics.txt`](metrics.txt); this file is the summary.
 | postings | 132,232,738 | 132,232,738 | **300,782,058** |
 | bytes / posting | 1.07 | 1.07 | 1.08 |
 | index size | **288 MB** | 288 MB | **488 MB** |
-| build time | **50.9 s** | 13.2 s | 46.2 s |
-| peak RSS | 1,050 MB | 1,685 MB | **1,825 MB** |
+| build time | **62.5 s** | 13.2 s | 46.2 s |
+| peak RSS | 918 MB | 1,685 MB | **1,825 MB** |
+
+The WSL column is the current binary (October 2026, 2 threads). The two
+`c5.xlarge` columns are the September binary; the sort, merge and index
+format are unchanged since, and the current and September builders produce
+byte-identical index files. In September the WSL build took 50.9 s on a less
+loaded host; back to back on one host, the September builder took 64.5 s and
+the current one 62.5 s.
 
 **The scaling claim:** with the identical binary, indexed source grew ×2.95 and
-postings ×2.27 while peak RSS grew **×1.08**. Memory is bounded by
-`threads × 256 MB run buffer + 134 MB offset table` plus per-file bookkeeping —
-it is a function of thread count, not corpus size. That is what the external
-merge sort is for.
+postings ×2.27 while peak RSS grew **×1.08**. Memory depends on thread count,
+not corpus size. That is what the external merge sort is for.
+
+**The memory bound, corrected.** Earlier versions of this file said
+`threads × 256 MB + 134 MB`. That left out the radix sort's 256 MB
+ping-pong buffer, which each thread allocated while it spilled, so the true
+bound was `threads × 512 MB + 134 MB` (the measured 1,825 MB on 4 threads
+already exceeded the stated 1,158 MB). The current build shares one scratch
+buffer that spills take turns on, so the bound is now
+`(threads + 1) × 256 MB + 134 MB` plus per-file bookkeeping: 902 MB on 2
+threads before bookkeeping (measured: 918 MB), 1,414 MB on 4.
 
 Index layout: 141 MB delta+varint postings, 12.7 MB inline skip blocks
 (8 bytes per 128 postings, 9.0%), 134 MB direct-addressed offset table
@@ -39,25 +54,46 @@ Index layout: 141 MB delta+varint postings, 12.7 MB inline skip blocks
 
 ## Query performance
 
-100 held-out queries mined from the kernel's own `scripts/`, `Documentation/`
-and Coccinelle patches (train/held-out split 200/100; thresholds tuned on
-train only). Index resident, 4 verification threads, best of 5, warm cache.
+Two workloads of 100 queries, measured on 2026-10-16 with the current binary:
 
-| | trigrep | ripgrep 14.1 (8 threads, unindexed scan) |
-|---|---|---|
-| p50 latency | **10.2 ms** | 1,013 ms |
-| p95 latency | 975 ms | — |
-| CPU per query (median) | **0.017 s** | 1.96 s |
-| candidate files (median) | **46 of 81,664** | — |
-| candidate files (p90) | 1,127 | — |
-| fallback to full scan | 0 / 100 | — |
+- **identifiers:** 100 held-out identifiers mined from the kernel's own
+  `scripts/`, `Documentation/` and Coccinelle patches (train/held-out split
+  200/100). This is literal search.
+- **regexes:** the same 100, each turned into a regex by one of five fixed
+  rules in `harness/regex_workload.py`: call site, anchored statement,
+  alternation of tails, optional suffixes, identifier-class prefix.
 
-Ratios at the median: **115× less CPU, 100× less wall time.** Both endpoints
-are printed so the ratio can be re-derived; CPU is measured inside the engine's
-repeat loop so process startup (fork, 288 MB mmap, parsing 81,664 paths) is
-excluded — that is the steady-state cost a resident service pays.
+Both tools are measured the same way: 5 runs per query, wall time is the best
+of 5 and CPU is the mean of 5, warm page cache. trigrep runs with the index
+resident and 2 verification threads (the VM has 2 vCPUs); its CPU is measured
+inside the engine's repeat loop, so process startup (fork, 288 MB mmap,
+parsing 81,664 paths) is excluded, which is the steady-state cost a resident
+service pays. ripgrep 14.1 runs with its default threads and `--no-ignore
+--hidden --max-filesize 8M`, so both tools search exactly the same files.
 
-The p95 tail is real and explained: candidates are **size-biased ~8.5× upward**
+| | identifiers: trigrep | ripgrep | regexes: trigrep | ripgrep |
+|---|---|---|---|---|
+| p50 latency | **9.8 ms** | 781 ms | **10.8 ms** | 822 ms |
+| p95 latency | 803 ms | 1,091 ms | 737 ms | 1,612 ms |
+| CPU per query (median) | **0.0135 s** | 1.71 s | **0.0179 s** | 1.92 s |
+| candidate files (median / p90) | 46 / 1,127 of 81,664 | all | 52 / 1,127 | all |
+| fallback to full scan | 0 / 100 | | 0 / 100 | |
+| file sets identical to ripgrep | **100 / 100** | | **100 / 100** | |
+
+Ratios at the median: identifiers **126× less CPU, 80× less wall time**;
+regexes **107× less CPU, 76× less wall time.** Both endpoints are printed so
+every ratio can be re-derived.
+
+**Against the first published table** (September: p50 10.2 ms, 115× CPU, 100×
+wall, identifiers only): that run timed ripgrep once against trigrep's best of
+5, let the two tools search different file sets (ripgrep skipped hidden files
+and read files over 8 MB), and labelled 2 verification threads as 4. The
+numbers above replace it. An earlier rerun the same day, on a host under heavy
+load (ripgrep itself 2.3× slower, and the WSL VM failed shortly after), gave
+21 to 23 ms and 101× to 104×; it is logged in `metrics.txt` and not used.
+
+The p95 tail is real and explained (figures from the September analysis):
+candidates are **size-biased ~8.5× upward**
 (mean 126 KB vs a 15 KB corpus mean), because a larger file holds more distinct
 trigrams and so satisfies more conjuncts. Common kernel symbols hand the DFA
 100+ MB to read. The DFA itself runs at 136–154 MB/s, inside RE2's own band.
@@ -75,15 +111,35 @@ trigrams and so satisfies more conjuncts. Common kernel symbols hand the DFA
 | `CONFIG_SMP` | 923 | 923 | exact |
 | `(foo\|bar)baz` | 5 | 5 | exact |
 
-**Differential oracle vs google-re2** — grammar-generated regexes over a
-2,000-file shard, with both the engine and the oracle restricted to the same
-files; every case also asserts the candidate count ≥ the oracle's match count.
+**Differential oracle vs google-re2**: grammar-generated regexes over a
+2,000-file shard, with the engine and the oracle reading exactly the same
+files and bytes. Both sides use multi-line anchors, files are compared as raw
+UTF-8 (no text-mode newline translation), and soundness is checked exactly:
+every file the oracle matches must be in the engine's candidate set.
 
-| tier | patterns | mismatches | unsound | note |
-|---|---|---|---|---|
-| 0 | 2,000 | 0 | 0 | |
-| A | 10,000 | **1 → 0** | 0 | found bug #8, fixed, re-run clean (see below) |
-| A (re-run) | 10,000 | **0** | **0** | post-fix; 770 s engine + 175 s oracle |
+| generator | binary | patterns | mismatches | unsound | superset check |
+|---|---|---|---|---|---|
+| v1 (tiers 0, A) | before bug #8 | 10,000 | 1 | 0 | count only |
+| v1 | after bug #8 | 10,000 | **0** | **0** | count only |
+| **v2** | before bugs #9 to #14 | 10,000 | **568** | **241** | count only |
+| **v2** | **fixed** | **10,000** | **0** | **0** | **exact** |
+
+The v1 generator only joined pieces with `.`, so it never put a group directly
+next to a literal, and it never produced anchors or escapes. That is why it
+passed a build with three bug classes in it. The v2 generator concatenates
+terms directly and adds `^ $`, `\d \w \s \D \W \S`, ranges, negated classes,
+digits and upper case. Run against the pre-fix binary, the same 10,000 v2
+patterns split by pattern feature:
+
+| cause | unsound | wrong answer |
+|---|---|---|
+| alternation with an unknown branch (bug #9) | 121 | 32 |
+| `\D \W \S`, or `\d` inside a class, read as letters (bug #10) | 85 | 140 |
+| `^` and `$` ignored by the verifier (bug #11) | 35 | 396 |
+
+v2 composition on the fixed binary: 3,788 of 10,000 patterns (37.9%) degrade
+to `ANY` and test only the verifier; 5,036 (50.4%) have a non-empty answer.
+Run time: 736 s engine, 765 s oracle, 2 vCPU.
 
 ## Ablations (one binary, one flag)
 
@@ -93,6 +149,9 @@ files; every case also asserts the candidate count ≥ the oracle's match count.
 | parallel verification, 4 threads | 477 → 274 ms | 1.7–1.8×; no gain at 8 threads on 4 cores (memory-bound DFA) |
 | skip-block cursor | plan 0.2–0.9 ms either way | makes the skip blocks *load-bearing*; planning was never the bottleneck |
 | 4-thread extraction | 82.8 → 50.9 s build | extraction is embarrassingly parallel; merge is not |
+| shared work queue + one shared radix scratch | 64.5 → 62.5 s, 892 → 918 MB peak | balanced threads, bound (threads + 1) × 256 MB; index files byte-identical |
+| DFA: byte classes, 64 MB cache budget, NFA fallback | `a[ab]{16}c` 3,270 → 836 ms on 960 KB | 2^17 live states no longer thrash a 20,000-state cache |
+| DFA, same change | `a[ab]{13}c` 318 → 88 ms; `a[ab]{10}c` 51 → 24 ms | best of 3, old and new binaries back to back on one host |
 
 ## Bugs found while building
 
@@ -105,9 +164,22 @@ files; every case also asserts the candidate count ≥ the oracle's match count.
 7. A broken `printf` segfaulted mid-output and truncated stdout, making the engine *look* unsound (315 vs 361 files). It never was.
 8. **Found by the oracle:** `(gre|(a)+.[mpwz])` missed a file where RE2 matched `'aßm'`. ß is two UTF-8 bytes; RE2 matches `.` against one *code point*, the DFA matched one *byte*. Any class admitting a byte ≥ 0x80 now compiles to the UTF-8 sequence automaton, as RE2 does. Verified against RE2 on 8 probes including negatives (`a..m` → 0/0).
 
+9. **Unsound, found in review:** alternation unioned the branches' prefix and suffix sets, reading an empty set ("unknown") as "no strings". `(abc|x.*)def` then demanded the trigram `bcd` and pruned a file containing `xyzdef` before verification. Fixed by keeping the merged set unknown if any branch is unknown; prefix and suffix sets now keep 2 bytes, which is all a join trigram needs. The v1 oracle could not reach this shape.
+10. `\b \B \D \W \S` were read as letters, and so was every escape inside a class (`[\d]` matched `d`). `\D \W \S` and class escapes are now implemented with RE2's ASCII meaning; everything unsupported is a pattern error, exit status 2.
+11. `^` and `$` were parsed into nothing, so `^#include` matched an indented `#include`. They are now line anchors in the NFA and the lazy DFA, which tracks start-of-line and resolves a pending `$` on the next `\n`.
+12. A DFA cache flush wrote the new transition into a stale state index and kept a stale start state. With the cache shrunk to force flushes, `a[ab]{6}c` found 1 of 20 matching files. States now belong to a cache generation. The same work replaced 1 KB transition rows with byte classes and a 64 MB budget, and falls back to NFA simulation after repeated flushes: `a[ab]{16}c` (2^17 states) went from 3,270 to 836 ms on 960 KB.
+13. Nested repeats multiplied the NFA: `(((ab){512}){512}){512}` ran 137 s and died with `bad_alloc`. The NFA is now capped at one million states, which makes it a pattern error.
+14. Writes were unchecked, so a full disk produced a truncated index that silently under-returned. Every write is now checked, and a `format` marker written last makes a partial index refuse to open.
+
+15. **Found by UBSan:** posting records start at arbitrary byte offsets, so the skip array inside a record is unaligned, and the cursor read it through a `SkipEntry*`. That is undefined behaviour: harmless on x86, a fault on stricter CPUs. Entries are now copied out with `memcpy`. The smoke test now has a query that seeks a 300-posting list through its skip blocks; the pre-fix code fails it under `make sanitize`.
+
 Harness bugs are logged in `metrics.txt` too (a GET-signed PUT, a two-pipe
 `Popen` deadlock, an OOM on a 3.9 GB VM); none touched the engine, every one
-cost a rerun.
+cost a rerun. Three more were measurement bugs, fixed in the October rerun:
+the oracle read files in text mode (turning CRLF into LF) and only compared
+candidate counts; the benchmark timed ripgrep once against trigrep's best of
+5, let the two tools search different file sets, and said 4 verification
+threads when the script passed none (the engine used its default of 2).
 
 ## Not done
 
@@ -118,8 +190,9 @@ cost a rerun.
 - **Positional (line-level) postings** would remove the p95 tail by
   verifying lines instead of whole files.
 - **LSM-style segments** for incremental re-indexing.
-- The workload has no class-only patterns, so it never exercises the
-  degrade-to-`ANY` fallback; a fallback rate is therefore not claimed.
+- Neither benchmark workload has class-only patterns, so neither exercises
+  the degrade-to-`ANY` fallback; a fallback rate is therefore not claimed.
+  The oracle does exercise it (37.9% of v2 patterns).
 - Two planner constants — `kSelectivityCap = 0.25` (drop a conjunct covering
   more than a quarter of the corpus) and `kCursorRatio = 8` (seek through
   skip blocks when a list is 8× longer than the accumulator) — are plausible

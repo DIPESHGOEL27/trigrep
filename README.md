@@ -32,7 +32,8 @@ verified exactly by a Thompson NFA with a lazily materialised DFA.
 | literal ≥ 3 bytes | AND of its trigrams | every match contains them |
 | literal < 3 bytes | ANY | carries no trigram |
 | concatenation | AND of both sides, plus trigrams straddling the join | the join bytes are also required |
-| alternation | OR of the branches | some branch must match |
+| alternation | OR of the branches | some branch must match; a prefix or suffix set is known only if it is known for every branch |
+| `^` `$` | ANY (consume nothing) | an anchor adds no bytes to the match |
 | `*` `?` `{0,n}` | ANY | zero repetitions must be allowed |
 | `+` `{m≥1,n}` | the child's query | at least one repetition |
 | class over the size cap | ANY | **degrade, never truncate** — a truncated set is unsound |
@@ -51,13 +52,16 @@ corpus ──walk──> distinct trigrams per file    2^24-bit presence set + d
 
 regex  ──parse─> AST                           recursive descent
        ──DFS───> trigram query                 post-order four-tuple: exact / prefix / suffix / query
-       ──plan──> candidates                    cost-ordered AND, galloping intersection, skip-block seeks
-       ──verify> matches                       memmem prefilter, Thompson NFA, lazy DFA, N threads
+       ──plan──> candidates                    cost-ordered AND, galloping intersection, skip-block seeks,
+                                               k-way OR merge on a min-heap
+       ──verify> matches                       memmem prefilter, Thompson NFA, lazy DFA over byte classes, N threads
 ```
 
-Peak memory during indexing is bounded by `threads × 256 MB + 134 MB`, not by
-corpus size: the same binary indexes 1.2 GB and 3.6 GB of source within 8% of
-the same peak RSS.
+Peak memory during indexing is bounded by `(threads + 1) × 256 MB + 134 MB`:
+a 256 MB run buffer per thread, one 256 MB radix-sort scratch that spills take
+turns on, and the offset table. It depends on thread count, not corpus size:
+the indexer indexed 1.2 GB and 3.6 GB of source within 8% of the same peak
+RSS. It uses up to 8 threads.
 
 ## Build and run
 
@@ -73,11 +77,16 @@ make
 Useful flags for `trigrep_search`: `--threads=N`, `--repeat=N` (amortise
 process startup; a service keeps the index resident), `--no-prefilter`
 (ablation), `--debug` (print the synthesised query and required literals),
-`--patterns-file=F` (one process, many queries — used by the oracle).
+`--patterns-file=F` (one process, many queries, used by the oracle),
+`--emit-candidates` (print the candidate set, for the oracle's superset check).
+Exit status follows grep: 0 if something matched, 1 if nothing did, 2 on a
+pattern error.
 
 `make check` runs an end-to-end smoke test on a synthetic corpus with exact
-assertions (literal, alternation, UTF-8 `.`, degrade-to-`ANY`, batch mode);
-CI runs it on every push.
+assertions, one per rule: literals, alternation with straddling trigrams,
+alternation with an unknown branch, UTF-8 `.`, line anchors, Perl classes,
+rejected escapes, the NFA size cap, degrade-to-`ANY`, batch mode and exit
+codes. CI runs it on every push.
 
 ## Reproduce the numbers
 
@@ -86,8 +95,12 @@ curl -O https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
 sha256sum -c corpus_sha256.txt && tar xf linux-6.6.tar.xz
 ./build/count_trigrams linux-6.6                     # 81,664 files, 132.2M postings
 ./build/trigrep_index  linux-6.6 index               # ~288 MB, prints build time and peak RSS
-python3 harness/bench.py harness/heldout.txt linux-6.6 index    # needs ripgrep on PATH
-pip install google-re2 && python3 harness/oracle.py index shard 2000 1 2 1
+python3 harness/bench.py harness/heldout.txt linux-6.6 index    # identifiers; needs ripgrep
+python3 harness/regex_workload.py harness/heldout.txt > regex.txt
+python3 harness/bench.py regex.txt linux-6.6 index              # the same 100, as regexes
+pip install google-re2
+python3 harness/make_shard.py linux-6.6 shard 2000 7 && ./build/trigrep_index shard shard_index
+TRIGREP_BIN=./build/trigrep_search python3 harness/oracle.py shard_index 10000 1 2 2
 ```
 
 Numbers in [RESULTS.md](RESULTS.md) were taken on WSL2 (2 vCPU) and an AWS
@@ -95,28 +108,49 @@ Numbers in [RESULTS.md](RESULTS.md) were taken on WSL2 (2 vCPU) and an AWS
 
 ## Regex support
 
-Literals, `.`, character classes, `\d \w \s`, `?` `*` `+` `{m,n}`,
-alternation, grouping, anchors. `.` and negated classes match one UTF-8 code
-point, as RE2 and ripgrep do. **No backreferences, no lookaround** — neither
-is linear-time nor indexable by this technique; that is a design decision,
-not a gap.
+An RE2-compatible subset, with RE2's meaning for every construct it accepts:
+
+- literals (a multi-byte UTF-8 character is one atom), `.`, `\n \t \r \f \v`
+  and escaped punctuation;
+- classes with ranges and negation, and `\d \w \s \D \W \S` both inside and
+  outside classes (ASCII, as in RE2);
+- `?` `*` `+` `{m,n}` with counts up to 1000, alternation, `(...)` and `(?:...)`;
+- `^` and `$` as line anchors, which is what grep and code search mean by them.
+
+`.`, negated classes and `\D \W \S` match one UTF-8 code point, as RE2 and
+ripgrep do.
+
+Everything else is **rejected with an error** rather than guessed at:
+`\b \B \A \z`, flags such as `(?i)`, non-ASCII characters inside a class,
+and patterns whose NFA would exceed one million states (nested repeats like
+`((x{512}){512}){512}`). **No backreferences, no lookaround**: neither is
+linear-time nor indexable by this technique; that is a design decision, not a
+gap.
 
 ## Verification
 
-- Six kernel queries against `grep -rlE` on all 81,664 files: file sets identical.
-- A grammar-driven differential oracle (`harness/oracle.py`) generates random
-  regexes and compares file sets against google-re2 on a 2,000-file shard,
-  asserting on every case that the candidate count is at least the oracle's
-  match count. It found one real bug (byte-vs-code-point semantics of `.`),
-  which is fixed; the counts are in RESULTS.md.
-- Every optimisation is behind a flag so it can be turned off and shown to
-  leave the result set unchanged.
+- **Full corpus vs ripgrep.** Every benchmark query (100 identifiers, 100
+  regexes) is diffed against ripgrep over all 81,664 files: 200 of 200 file
+  sets identical. Six earlier kernel queries matched `grep -rlE` exactly.
+- **Differential oracle vs google-re2** (`harness/oracle.py`): 10,000
+  grammar-generated regexes over a 2,000-file shard, with an exact superset
+  check on every case (every true match must be in the candidate set). The
+  pre-fix binary failed 809 of them, 241 unsound, across three bug classes;
+  the fixed binary fails none. The first generator could not produce those
+  shapes, which is how they shipped; RESULTS.md has the breakdown.
+- **Sanitizers.** `make sanitize` runs the smoke test under ASan and UBSan,
+  in CI on every push. 1,000 oracle patterns under both: no reports. UBSan
+  found a misaligned read in the skip-block cursor that no other test hit.
+- **Ablations.** Every optimisation is behind a flag so it can be turned off
+  and shown to leave the result set unchanged.
 
 ## Harness
 
 `harness/bench.py` measures latency and CPU per query against an unindexed
-ripgrep scan on a held-out workload. `harness/gen_regex.py` + `oracle.py` is
-the differential fuzzer. `harness/aws_bootstrap.sh` is the user-data script
+ripgrep scan, best of 5 for both tools, and diffs every query's file set
+against ripgrep's. `harness/regex_workload.py` turns the identifier workload
+into a regex workload by five fixed rules. `harness/gen_regex.py`,
+`make_shard.py` and `oracle.py` are the differential fuzzer. `harness/aws_bootstrap.sh` is the user-data script
 for the cross-corpus scaling run. `metrics.txt` is the raw, append-only log of
 every measurement, including the ones that went wrong and why.
 
