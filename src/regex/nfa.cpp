@@ -1,4 +1,5 @@
 #include "nfa.hpp"
+#include <stdexcept>
 
 namespace {
 // Dangling exits are recorded as (state index, which field) pairs, NOT as
@@ -9,7 +10,10 @@ struct Frag { int entry; std::vector<Out> outs; };
 
 struct B {
     Nfa n;
-    int add(const NState& s) { n.st.push_back(s); return int(n.st.size()) - 1; }
+    int add(const NState& s) {
+        if (n.st.size() >= kMaxNfaStates) throw std::length_error("pattern too large (NFA state limit)");
+        n.st.push_back(s); return int(n.st.size()) - 1;
+    }
     int add_split() { NState s{}; s.split = true; return add(s); }
     void patch(const std::vector<Out>& outs, int target) {
         for (const Out& o : outs) (o.is_alt ? n.st[size_t(o.state)].alt
@@ -23,6 +27,9 @@ struct B {
     Frag go(const Node* nd) {
         switch (nd->op) {
         case Op::Empty: { int s = add_split(); return {s, {{s, false}}}; }
+        case Op::Bol: case Op::Eol: {
+            NState a{}; (nd->op == Op::Bol ? a.assert_bol : a.assert_eol) = true;
+            int s = add(a); return {s, {{s, false}}}; }
         case Op::Literal: {
             int entry = -1, prev = -1;
             for (unsigned char c : nd->lit) {
@@ -42,9 +49,12 @@ struct B {
             // RE2 does: a class that admits any byte >= 0x80 is compiled into
             // the UTF-8 sequence automaton -- ASCII | 2-byte | 3-byte | 4-byte
             // -- so it consumes a whole well-formed code point.
-            bool high = false;
-            for (int c = 0x80; c < 256; ++c) if (nd->cls.test(size_t(c))) { high = true; break; }
-            if (!high) { NState s{}; s.cls = nd->cls; int id = add(s); return {id, {{id, false}}}; }
+            // Only a class admitting EVERY high byte means "any non-ASCII code
+            // point" (dot, negated classes, \W \S \D). The parser rejects
+            // non-ASCII class members, so no other mix can reach here.
+            bool all_high = true;
+            for (int c = 0x80; c < 256; ++c) if (!nd->cls.test(size_t(c))) { all_high = false; break; }
+            if (!all_high) { NState s{}; s.cls = nd->cls; int id = add(s); return {id, {{id, false}}}; }
 
             auto range = [&](int lo, int hi) { NState s{}; for (int c = lo; c <= hi; ++c) s.cls.set(size_t(c)); return add(s); };
             auto cont  = [&]() { return range(0x80, 0xBF); };

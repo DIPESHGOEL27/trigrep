@@ -4,7 +4,9 @@
 #include <memory>
 #include <bitset>
 
-enum class Op { Empty, Literal, Class, Concat, Alt, Star, Plus, Quest, Repeat };
+// Bol / Eol are the multi-line anchors ^ and $: they consume nothing, so for
+// trigram synthesis they behave exactly like Empty, but the verifier honours them.
+enum class Op { Empty, Literal, Class, Concat, Alt, Star, Plus, Quest, Repeat, Bol, Eol };
 
 struct Node {
     Op op = Op::Empty;
