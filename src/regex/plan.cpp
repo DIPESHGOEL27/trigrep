@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <iterator>
 #include <functional>
+#include <queue>
+#include <utility>
 
 static void all_docs(const IndexReader& ix, std::vector<DocId>& out) {
     out.resize(ix.num_docs());
@@ -61,16 +63,28 @@ void eval_query(const TriQuery& q, const IndexReader& ix, std::vector<DocId>& ou
         if (!have) all_docs(ix, out);
         return; }
     case TriQuery::OR: {
-        std::vector<DocId> acc, tmp, merged;
-        for (const auto& k : q.kids) {
-            eval_query(k, ix, tmp);
-            merged.clear();
-            merged.reserve(acc.size() + tmp.size());
-            std::set_union(acc.begin(), acc.end(), tmp.begin(), tmp.end(),
-                           std::back_inserter(merged));
-            acc.swap(merged);
+        // k-way merge on a min-heap of (docid, list) heads: one pass over all
+        // k lists, O(N log k), duplicates collapsed as they surface. The first
+        // version folded the lists in with repeated pairwise unions, which
+        // re-copies the accumulator k times.
+        std::vector<std::vector<DocId>> lists(q.kids.size());
+        for (size_t i = 0; i < q.kids.size(); ++i) eval_query(q.kids[i], ix, lists[i]);
+        using Head = std::pair<DocId, size_t>;
+        std::priority_queue<Head, std::vector<Head>, std::greater<Head>> heap;
+        std::vector<size_t> pos(lists.size(), 0);
+        size_t total = 0;
+        for (size_t i = 0; i < lists.size(); ++i) {
+            total += lists[i].size();
+            if (!lists[i].empty()) heap.push({lists[i][0], i});
         }
-        out.swap(acc);
+        out.clear();
+        out.reserve(std::min(total, ix.num_docs()));
+        while (!heap.empty()) {
+            auto [d, i] = heap.top();
+            heap.pop();
+            if (out.empty() || out.back() != d) out.push_back(d);
+            if (++pos[i] < lists[i].size()) heap.push({lists[i][pos[i]], i});
+        }
         return; }
     }
 }
